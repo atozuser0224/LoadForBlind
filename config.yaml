@@ -1,0 +1,6 @@
+train: /home/arot/Road_Segmentation/dataset/train/images
+val: /home/arot/Road_Segmentation/dataset/val/images
+
+# https://universe.roboflow.com/sidewalk-ykosy/sidewalk_segment3/dataset/5
+nc: 4
+names: ['Downstairs', 'Road', 'Sidewalk', 'Upstairs']
