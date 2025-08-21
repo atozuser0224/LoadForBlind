@@ -1,0 +1,149 @@
+import requests
+import math
+import time
+import logging
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# --- Config ---
+CONFIG = {
+    'APP_KEY': "YOUR_TMAP_APPKEY",  # 🔐 실제 AppKey 입력
+    'CNT_BUFF': 10,
+    'SPLIT_VALUE': 20,
+    'REQ_LIMIT_PER_SEC': 1,
+    'MAX_RETRIES': 3,
+    'POINTS_FILE': 'points.txt',  # 좌표 불러올 파일명
+}
+
+# --- Load GPS points from file ---
+def load_points(filepath):
+    try:
+        with open(filepath, 'r') as f:
+            raw = [float(x.strip()) for x in f.read().split(',')]
+        if len(raw) % 2 != 0:
+            raise ValueError("좌표 개수는 짝수여야 합니다 (경도, 위도 쌍).")
+        return raw
+    except FileNotFoundError:
+        logging.error(f"파일을 찾을 수 없습니다: {filepath}")
+        return []
+    except ValueError as ve:
+        logging.error(f"좌표 파일 오류: {ve}")
+        return []
+
+# --- Haversine 거리 계산 ---
+def calculate_distance(lon1, lat1, lon2, lat2):
+    R = 6371000  # Earth radius in meters
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return round(R * c, 2)
+
+# --- TMAP API 요청 ---
+def req_load_api(point_string, app_key):
+    url = 'https://apis.openapi.sk.com/tmap/road/matchToRoads500?version=1'
+    headers = {"appKey": app_key}
+    data = {
+        "responseType": "1",
+        "coords": point_string
+    }
+
+    for attempt in range(1, CONFIG['MAX_RETRIES'] + 1):
+        try:
+            response = requests.post(url, headers=headers, data=data)
+            if response.status_code == 401:
+                raise Exception("인증 실패: AppKey를 확인하세요.")
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"[시도 {attempt}] API 요청 실패: {e}")
+            time.sleep(1)
+
+    logging.error("API 요청 재시도 실패. 이 구간은 건너뜁니다.")
+    return None
+
+# --- 메인 처리 ---
+def process_points(points):
+    state = {
+        'tot_distance': 0.0,
+        'tot_point_count': 0,
+        'arr_matched_id': set(),
+        'last_matched_location': None,
+        'cnt_req_api': 0
+    }
+
+    index = 0
+    total_len = len(points)
+
+    logging.info("- LoadApi 요청 작업 시작 -")
+
+    while index < total_len:
+        start_index = max(0, index - CONFIG['CNT_BUFF'] * 2 if state['cnt_req_api'] > 0 else index)
+        end_index = min(total_len, index + CONFIG['SPLIT_VALUE'] * 2)
+
+        coords = [f"{points[i]},{points[i + 1]}" for i in range(start_index, end_index, 2)]
+        if not coords:
+            break
+
+        point_string = '|'.join(coords)
+        response = req_load_api(point_string, CONFIG['APP_KEY'])
+        state['cnt_req_api'] += 1
+
+        matched_points = response.get('resultData', {}).get('matchedPoints', []) if response else []
+        if not matched_points:
+            logging.info("매칭된 도로 없음.")
+            index += CONFIG['SPLIT_VALUE'] * 2
+            time.sleep(1 / CONFIG['REQ_LIMIT_PER_SEC'])
+            continue
+
+        cal_points = []
+
+        if state['last_matched_location']:
+            cal_points.append(state['last_matched_location'])
+            state['last_matched_location'] = None
+
+        for mp in matched_points:
+            matched_id = f"{mp.get('linkId')}_{mp.get('idxName')}"
+            state['arr_matched_id'].add(matched_id)
+
+            loc = mp.get('matchedLocation')
+            if loc:
+                cal_points.append({
+                    'longitude': loc['longitude'],
+                    'latitude': loc['latitude']
+                })
+
+        if cal_points:
+            state['last_matched_location'] = cal_points[-1]
+
+        for i in range(len(cal_points) - 1):
+            p1, p2 = cal_points[i], cal_points[i + 1]
+            state['tot_distance'] += calculate_distance(p1['longitude'], p1['latitude'], p2['longitude'], p2['latitude'])
+
+        added_points = len(cal_points)
+        if state['cnt_req_api'] > 1 and added_points >= CONFIG['CNT_BUFF']:
+            added_points -= CONFIG['CNT_BUFF']
+        state['tot_point_count'] += added_points
+
+        logging.info(f"📏 총 거리: {state['tot_distance']:.2f}m")
+        logging.info(f"🧭 매칭된 링크 수: {len(state['arr_matched_id'])}개")
+        logging.info(f"🧮 총 좌표 수: {state['tot_point_count']}개")
+        logging.info("------------------------------------------")
+
+        index += CONFIG['SPLIT_VALUE'] * 2
+        if index < total_len:
+            time.sleep(1 / CONFIG['REQ_LIMIT_PER_SEC'])
+
+    logging.info("- LoadApi 요청 작업 완료 -")
+
+# --- Entry Point ---
+if __name__ == "__main__":
+    all_points = load_points(CONFIG['POINTS_FILE'])
+
+    if not all_points:
+        logging.error("좌표 데이터를 불러오지 못했습니다. 프로그램을 종료합니다.")
+    elif len(all_points) <= CONFIG['CNT_BUFF'] * 2 or CONFIG['SPLIT_VALUE'] <= CONFIG['CNT_BUFF'] or CONFIG['SPLIT_VALUE'] > 500:
+        logging.error("설정 오류: 좌표 수는 버퍼보다 많아야 하며 SPLIT_VALUE는 500 이하여야 합니다.")
+    else:
+        process_points(all_points)
