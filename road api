@@ -1,0 +1,174 @@
+import requests
+import math
+import time
+
+# --- Configuration ---
+APP_KEY = "YOUR_TMAP_APPKEY"  # Replace with your actual AppKey
+CNT_BUFF = 10
+SPLIT_VALUE = 20
+REQ_LIMIT_PER_SEC = 1
+MAX_RETRIES = 3
+
+# --- Data ---
+ALL_POINTS_RAW = [
+    126.95042955033101, 37.39952907832974,
+    126.95100890747277, 37.39935861417968,
+    126.95184575668353, 37.399171103167795,
+    126.95238219849246, 37.39836991446609,
+    126.95221053711612, 37.39727892033366,
+    126.95343362442138, 37.39680160540712,
+    126.95515023819372, 37.397790325810476,
+    126.95680247894435, 37.397994887024126,
+    126.95695268264977, 37.39847219435172,
+    126.95695268264977, 37.39956317111266,
+    126.95645915619167, 37.400790500985025,
+    126.95703851334244, 37.40133597447641,
+    126.95800410858769, 37.40179621464611,
+    126.95937739959838, 37.40169393929715,
+    126.96064340225449, 37.40106323822738,
+    126.96074264399483, 37.4001811001235,
+    126.96189062945639, 37.39907308586036,
+    126.96211593503247, 37.398126999177244,
+    126.96302788610492, 37.39865118381423,
+    126.9626470124259, 37.398114214139916
+]
+
+# --- Global State ---
+tot_distance = 0
+tot_point_count = 0
+arr_matched_id = set()
+last_matched_location = None
+cnt_req_api = 0
+
+
+# --- Helper Functions ---
+def log_message(msg):
+    print(msg)
+
+
+def deg2rad(deg):
+    return deg * math.pi / 180
+
+
+def rad2deg(rad):
+    return rad * 180 / math.pi
+
+
+def calculate_distance(lon1, lat1, lon2, lat2):
+    if lon1 == lon2 and lat1 == lat2:
+        return 0
+
+    theta = lon1 - lon2
+    dist = math.sin(deg2rad(lat1)) * math.sin(deg2rad(lat2)) + \
+           math.cos(deg2rad(lat1)) * math.cos(deg2rad(lat2)) * math.cos(deg2rad(theta))
+    
+    # 범위 제한 처리
+    dist = max(min(dist, 1.0), -1.0)
+
+    dist = math.acos(dist)
+    dist = rad2deg(dist)
+    dist = dist * 60 * 1.1515 * 1.609344 * 1000.0  # miles to meters
+    return round(dist, 2)
+
+
+def req_load_api(point_string, app_key):
+    url = 'https://apis.openapi.sk.com/tmap/road/matchToRoads500?version=1'
+    headers = {"appKey": app_key}
+    data = {
+        "responseType": "1",
+        "coords": point_string
+    }
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.post(url, headers=headers, data=data)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            log_message(f"[시도 {attempt}] API 요청 실패: {e}")
+            time.sleep(1)
+
+    log_message("⚠️ API 요청 재시도 실패, 건너뜁니다.")
+    return None
+
+
+def process_points():
+    global tot_distance, tot_point_count, arr_matched_id, last_matched_location, cnt_req_api
+
+    current_index = 0
+    total_len = len(ALL_POINTS_RAW)
+
+    log_message("- LoadApi 요청 작업 시작 -")
+    log_message('------------------------------------------')
+
+    while current_index < total_len:
+        start_index = max(0, current_index - CNT_BUFF * 2 if cnt_req_api > 0 else current_index)
+        end_index = min(total_len, current_index + SPLIT_VALUE * 2)
+
+        coords = []
+        for i in range(start_index, end_index, 2):
+            coords.append(f"{ALL_POINTS_RAW[i]},{ALL_POINTS_RAW[i + 1]}")
+
+        if not coords:
+            break
+
+        point_string = '|'.join(coords)
+        response = req_load_api(point_string, APP_KEY)
+        cnt_req_api += 1
+
+        matched_points = response.get('resultData', {}).get('matchedPoints', []) if response else []
+
+        if not matched_points:
+            log_message("No matched points in response.")
+            current_index += SPLIT_VALUE * 2
+            time.sleep(1 / REQ_LIMIT_PER_SEC)
+            continue
+
+        points_for_distance = []
+
+        if last_matched_location:
+            points_for_distance.append(last_matched_location)
+            last_matched_location = None
+
+        for matched_obj in matched_points:
+            matched_id = f"{matched_obj.get('linkId')}_{matched_obj.get('idxName')}"
+            arr_matched_id.add(matched_id)
+
+            loc = matched_obj.get('matchedLocation')
+            if loc:
+                points_for_distance.append({
+                    'longitude': loc['longitude'],
+                    'latitude': loc['latitude']
+                })
+
+        if points_for_distance:
+            last_matched_location = points_for_distance[-1]
+
+        for k in range(len(points_for_distance) - 1):
+            p1 = points_for_distance[k]
+            p2 = points_for_distance[k + 1]
+            tot_distance += calculate_distance(p1['longitude'], p1['latitude'], p2['longitude'], p2['latitude'])
+
+        added_points = len(points_for_distance)
+        if cnt_req_api > 1 and added_points >= 1:
+            added_points -= 1  # 중복 버퍼 보정
+        tot_point_count += added_points
+
+        log_message(f"총 거리 : {tot_distance:.2f}m")
+        log_message(f"매칭된 링크의 개수 : {len(arr_matched_id)}개")
+        log_message(f"총 좌표의 개수 : {tot_point_count}개")
+        log_message('------------------------------------------')
+
+        current_index += SPLIT_VALUE * 2
+        if current_index < total_len:
+            time.sleep(1 / REQ_LIMIT_PER_SEC)
+
+    log_message("- LoadApi 요청 작업 완료 -")
+
+
+# --- Main ---
+if __name__ == "__main__":
+    if len(ALL_POINTS_RAW) <= (CNT_BUFF * 2) or SPLIT_VALUE <= CNT_BUFF or SPLIT_VALUE > 500:
+        print("Error: 좌표 개수는 버퍼보다 커야 하고, SPLIT_VALUE는 500 이하여야 합니다.")
+    else:
+        process_points()
